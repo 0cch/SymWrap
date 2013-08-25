@@ -5,8 +5,7 @@ A class for dia(Debug Interface Access)
 
 
 
-Sample
-=======
+### Sample
 
 		CString PdbName = L"sample.pdb";
 		CString Regexp = L"_PEB";
