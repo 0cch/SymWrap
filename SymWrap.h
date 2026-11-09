@@ -1,6 +1,7 @@
 #ifndef SYMWRAP_H
 #define SYMWRAP_H
 
+#include <memory>
 #include <atlbase.h>
 #include <atlstr.h>
 #include <Dia2.h>

@@ -2205,8 +2205,8 @@ void SymBase::EnumEveryChild()
 			if (FAILED(SymEnumInst.Item(static_cast<ULONG>(i), Child)) || Child == NULL) {
 				continue;
 			}
-			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
-			if (p != NULL) {
+			std::unique_ptr<SymBase> p(SymBase::SymNew(Child));
+			if (p) {
 				p->GetDecl(Info);
 			}
 		}
@@ -2345,8 +2345,8 @@ HRESULT SymFunc::GetDecl(CString &Info)
 	}
 
 	CString FuncTypeStr;
-	CAutoPtr<SymBase> SubSym(SymBase::SymNew(FuncType));
-	if (SubSym == NULL) {
+	std::unique_ptr<SymBase> SubSym(SymBase::SymNew(FuncType));
+	if (!SubSym) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SubSym->GetDecl(FuncTypeStr);
@@ -2376,8 +2376,8 @@ HRESULT SymFunc::GetDecl(CString &Info)
 				continue;
 			}
 
-			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
-			if (p == NULL) {
+			std::unique_ptr<SymBase> p(SymBase::SymNew(Child));
+			if (!p) {
 				return E_OUTOFMEMORY;
 			}
 
@@ -2430,8 +2430,8 @@ HRESULT SymFuncType::GetDecl(CString &Info)
 		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
-	CAutoPtr<SymBase> SubSym(SymBase::SymNew(FuncBaseType));
-	if (SubSym == NULL) {
+	std::unique_ptr<SymBase> SubSym(SymBase::SymNew(FuncBaseType));
+	if (!SubSym) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SubSym->GetDecl(Info);
@@ -2454,8 +2454,8 @@ HRESULT SymFuncType::GetDef( CString &Info )
 		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
-	CAutoPtr<SymBase> SubSym(SymBase::SymNew(FuncBaseType));
-	if (SubSym == NULL) {
+	std::unique_ptr<SymBase> SubSym(SymBase::SymNew(FuncBaseType));
+	if (!SubSym) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SubSym->GetDecl(Info);
@@ -2495,8 +2495,8 @@ HRESULT SymFuncType::GetDef( CString &Info )
 				continue;
 			}
 
-			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
-			if (p == NULL) {
+			std::unique_ptr<SymBase> p(SymBase::SymNew(Child));
+			if (!p) {
 				return E_OUTOFMEMORY;
 			}
 
@@ -2582,8 +2582,8 @@ HRESULT SymFuncArgType::GetDecl( CString &Info )
 		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
-	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
-	if (SymSub == NULL) {
+	std::unique_ptr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (!SymSub) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SymSub->GetDecl(Info);
@@ -2612,8 +2612,8 @@ HRESULT SymPointerType::GetDecl( CString &Info )
 		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
-	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
-	if (SymSub == NULL) {
+	std::unique_ptr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (!SymSub) {
 		return E_OUTOFMEMORY;
 	}
 
@@ -2777,8 +2777,8 @@ HRESULT SymUDT::GetDef( CString &Info )
 				continue;
 			}
 
-			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
-			if (p == NULL) {
+			std::unique_ptr<SymBase> p(SymBase::SymNew(Child));
+			if (!p) {
 				return E_OUTOFMEMORY;
 			}
 
@@ -2965,8 +2965,8 @@ HRESULT SymDataType::GetDef( CString &Info )
 		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
-	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
-	if (SymSub == NULL) {
+	std::unique_ptr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (!SymSub) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SymSub->GetDecl(Info);
@@ -3030,8 +3030,8 @@ HRESULT SymTypedef::GetDef( CString &Info )
 	}
 
 	CString TypeStr;
-	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
-	if (SymSub == NULL) {
+	std::unique_ptr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (!SymSub) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SymSub->GetDecl(TypeStr);
@@ -3069,8 +3069,8 @@ HRESULT SymArray::GetDecl( CString &Info )
 	}
 
 	CString TypeStr;
-	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
-	if (SymSub == NULL) {
+	std::unique_ptr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (!SymSub) {
 		return E_OUTOFMEMORY;
 	}
 	hr = SymSub->GetDecl(TypeStr);

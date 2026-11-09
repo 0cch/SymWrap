@@ -67,8 +67,8 @@ int wmain()
             continue;
         }
 
-        CAutoPtr<SymBase> p(SymBase::SymNew(Symbol));
-        if (p == NULL) {
+        std::unique_ptr<SymBase> p(SymBase::SymNew(Symbol));
+        if (!p) {
             continue;
         }
 
