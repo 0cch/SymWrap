@@ -1,5 +1,5 @@
-#ifndef __SYM_WRAP_H__
-#define __SYM_WRAP_H__
+#ifndef SYMWRAP_H
+#define SYMWRAP_H
 
 #include <atlbase.h>
 #include <atlstr.h>
@@ -10,12 +10,12 @@
 #ifdef _DEBUG
 #define VERIFY_EXP(x)	ATLASSERT(x)		 
 #else
-#define VERIFY_EXP(x)	((x) = (x))
+#define VERIFY_EXP(x)	((void)(x))
 #endif
 
 
-#define HR_OK(x) (x == S_OK)
-#define HR_NOK(x) (x != S_OK)
+#define HR_OK(x) SUCCEEDED(x)
+#define HR_NOK(x) FAILED(x)
 #define BOOL_STR(x) ((x) ? L"TRUE" : L"FALSE")
 
 
@@ -155,35 +155,59 @@ typedef CSimpleMap<ULONG, CString> SymbolInfoTable;
 
 
 class SymLoader {
-
-public:
-	SymLoader() {CoInitialize(NULL);}
-	~SymLoader() {
-		_DiaSession.Release();
-		_DataSource.Release();
-		CoUninitialize();
-	}
-
-	HRESULT Init();
-	HRESULT Open(LPWSTR FilePath);
-	IDiaSymbol *GetSymbol();
-
 private:
+	class ComInitializer {
+	public:
+		ComInitializer();
+		~ComInitializer();
+
+		ComInitializer(const ComInitializer &) = delete;
+		ComInitializer &operator=(const ComInitializer &) = delete;
+
+		HRESULT Result() const { return _Result; }
+		bool IsUsable() const { return SUCCEEDED(_Result) || _Result == RPC_E_CHANGED_MODE; }
+
+	private:
+		HRESULT _Result;
+		bool _OwnsInitialization;
+	};
+
+	ComInitializer _ComInitializer;
 	CComPtr<IDiaDataSource> _DataSource;
 	CComPtr<IDiaSession> _DiaSession;
+
+public:
+	SymLoader();
+	~SymLoader() = default;
+
+	SymLoader(const SymLoader &) = delete;
+	SymLoader &operator=(const SymLoader &) = delete;
+
+	HRESULT Init();
+	HRESULT Open(LPCWSTR FilePath);
+	HRESULT GetSymbol(CComPtr<IDiaSymbol> &Symbol);
+	// Compatibility overload. The returned interface has one owned reference.
+	IDiaSymbol *GetSymbol();
 };
 
 class SymEnumTool {
 
 public:
-	SymEnumTool(IDiaEnumSymbols *DiaEnumSymbols) : _DiaEnumSymbols(DiaEnumSymbols) {}
+	// The raw-pointer constructor adds its own reference; the caller still owns
+	// the reference passed in. Prefer the CComPtr overload.
+	explicit SymEnumTool(IDiaEnumSymbols *DiaEnumSymbols) : _DiaEnumSymbols(DiaEnumSymbols) {}
+	explicit SymEnumTool(const CComPtr<IDiaEnumSymbols> &DiaEnumSymbols) : _DiaEnumSymbols(DiaEnumSymbols) {}
 	~SymEnumTool() {}
 
-	LONG GetCount();
+	HRESULT GetCount(LONG &Count) const;
+	LONG GetCount() const;
+	HRESULT Item(ULONG Index, CComPtr<IDiaSymbol> &Symbol) const;
+	// Compatibility overloads return one owned reference.
 	IDiaSymbol* Item(ULONG Index);
+	HRESULT Next(CComPtr<IDiaSymbol> &Symbol) const;
 	IDiaSymbol* Next();
-	HRESULT Skip(ULONG Celt);
-	HRESULT Reset();
+	HRESULT Skip(ULONG Celt) const;
+	HRESULT Reset() const;
 
 private:
 	CComPtr<IDiaEnumSymbols> _DiaEnumSymbols;
@@ -192,12 +216,18 @@ private:
 class SymBase {
 
 public:
-	SymBase(IDiaSymbol *DiaSymbol) : _DiaSymbol(DiaSymbol) {}
-	~SymBase() {}
+	// The raw-pointer constructor adds its own reference; the caller still owns
+	// the reference passed in. Prefer the CComPtr overload.
+	explicit SymBase(IDiaSymbol *DiaSymbol) : _DiaSymbol(DiaSymbol) {}
+	explicit SymBase(const CComPtr<IDiaSymbol> &DiaSymbol) : _DiaSymbol(DiaSymbol) {}
+	virtual ~SymBase() = default;
 
-	IDiaEnumSymbols* GetEnum(enum SymTagEnum Symtag = SymTagNull, LPWSTR Name = NULL, ULONG Flags = nsNone);
-	ULONG GetTag();
-	const CComPtr<IDiaSymbol> Self() {return _DiaSymbol;}
+	HRESULT GetEnum(CComPtr<IDiaEnumSymbols> &Result, enum SymTagEnum Symtag = SymTagNull, LPCWSTR Name = NULL, ULONG Flags = nsNone) const;
+	// Compatibility overload. The returned enumerator has one owned reference.
+	IDiaEnumSymbols* GetEnum(enum SymTagEnum Symtag = SymTagNull, LPCWSTR Name = NULL, ULONG Flags = nsNone) const;
+	HRESULT GetTag(ULONG &SymTag) const;
+	ULONG GetTag() const;
+	const CComPtr<IDiaSymbol> &Self() const {return _DiaSymbol;}
 	virtual HRESULT GetDecl(CString &Info);
 	virtual HRESULT GetDef(CString &Info);
 	HRESULT GetInfoTable(SymbolInfoTable &InfoTable);
@@ -206,20 +236,23 @@ public:
 	
 
 
+	// The raw-pointer overload adds its own reference; the caller retains the
+	// supplied reference. Prefer the CComPtr overload.
 	static SymBase* SymNew(IDiaSymbol *Type);
+	static SymBase* SymNew(const CComPtr<IDiaSymbol> &Type);
 	
 
 protected:
-	LPCWSTR GetBaseTypeStr(ULONG Index, ULONG Length);
-	LPCWSTR GetAccessStr(ULONG Index);
-	LPCWSTR GetLanguageStr(ULONG Index);
-	LPCWSTR GetLocationTypeStr(ULONG Index);
-	LPCWSTR GetMachineTypeStr(ULONG Index);
-	LPCWSTR GetSymTagStr(ULONG Index);
-	LPCWSTR GetUdtKindStr(ULONG Index);
-	LPCWSTR GetSymbolTypeStr(ULONG Index);
-	LPCWSTR GetCallingConventionStr(ULONG Index);
-	LPCWSTR GetDataKindStr(ULONG Index);
+	LPCWSTR GetBaseTypeStr(ULONG Index, ULONG Length) const;
+	LPCWSTR GetAccessStr(ULONG Index) const;
+	LPCWSTR GetLanguageStr(ULONG Index) const;
+	LPCWSTR GetLocationTypeStr(ULONG Index) const;
+	LPCWSTR GetMachineTypeStr(ULONG Index) const;
+	LPCWSTR GetSymTagStr(ULONG Index) const;
+	LPCWSTR GetUdtKindStr(ULONG Index) const;
+	LPCWSTR GetSymbolTypeStr(ULONG Index) const;
+	LPCWSTR GetCallingConventionStr(ULONG Index) const;
+	LPCWSTR GetDataKindStr(ULONG Index) const;
 
 private:
 	CComPtr<IDiaSymbol> _DiaSymbol;
@@ -256,7 +289,7 @@ public:
 	virtual HRESULT GetDef(CString &Info);
 
 private:
-	LPCWSTR GetBaseTypeStr(CComPtr<IDiaSymbol> BaseType);
+	LPCWSTR GetBaseTypeStr(const CComPtr<IDiaSymbol> &BaseType) const;
 	
 };
 

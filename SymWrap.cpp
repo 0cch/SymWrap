@@ -1,90 +1,301 @@
 #include "SymWrap.h"
+#include <diacreate.h>
+#include <string>
 
 
-HRESULT SymLoader::Open( LPWSTR FilePath )
+namespace {
+
+std::wstring GetModuleDirectory(HMODULE Module)
 {
-	HRESULT hr = _DataSource->loadDataFromPdb(FilePath);
-	ATLASSERT(HR_OK(hr));
-	return hr;
-}
+	DWORD Capacity = MAX_PATH;
+	for (;;) {
+		std::wstring Path(Capacity, L'\0');
+		DWORD Length = GetModuleFileNameW(Module, &Path[0], Capacity);
+		if (Length == 0) {
+			return std::wstring();
+		}
 
-IDiaSymbol * SymLoader::GetSymbol()
-{
-	HRESULT hr = _DataSource->openSession(&_DiaSession);
-	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return NULL;
+		if (Length < Capacity) {
+			Path.resize(Length);
+			const std::wstring::size_type Slash = Path.find_last_of(L"\\/");
+			if (Slash == std::wstring::npos) {
+				return std::wstring();
+			}
+			return Path.substr(0, Slash);
+		}
+
+		if (Capacity >= 32768) {
+			return std::wstring();
+		}
+		Capacity *= 2;
 	}
-
-	IDiaSymbol *GlobalSymbol = NULL;
-	hr = _DiaSession->get_globalScope(&GlobalSymbol);
-	ATLASSERT(HR_OK(hr));
-
-	return GlobalSymbol;
 }
 
-HRESULT SymLoader::Init()
+HRESULT CreateDiaDataSource(CComPtr<IDiaDataSource> &DataSource)
 {
 	HRESULT hr = CoCreateInstance(CLSID_DiaSource,
 		NULL,
 		CLSCTX_INPROC_SERVER,
 		__uuidof(IDiaDataSource),
-		(PVOID *)&_DataSource);
-	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-
-typedef HRESULT (__stdcall *DLLREGISTERSERVER)();
-
-		HMODULE Moudle = LoadLibraryW(L"msdia100.dll");
-		if (Moudle == NULL) {
-			return hr;
-		}
-
-		DLLREGISTERSERVER RegisterServerFunc 
-			= (DLLREGISTERSERVER)GetProcAddress(Moudle, "DllRegisterServer");
-		if (RegisterServerFunc == NULL) {
-			FreeLibrary(Moudle);
-			return hr;
-		}
-
-		hr = RegisterServerFunc();
-		FreeLibrary(Moudle);
-		if (HR_NOK(hr)) {
-			return hr;
-		}
-
-		hr = CoCreateInstance(CLSID_DiaSource,
-			NULL,
-			CLSCTX_INPROC_SERVER,
-			__uuidof(IDiaDataSource),
-			(PVOID *)&_DataSource);
-
+		reinterpret_cast<void **>(&DataSource));
+	if (SUCCEEDED(hr)) {
+		return hr;
 	}
 
+	HRESULT LastError = hr;
+	HMODULE Module = NULL;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&CreateDiaDataSource),
+			&Module)) {
+		Module = NULL;
+	}
+
+	std::wstring Directories[] = {
+		GetModuleDirectory(Module),
+		GetModuleDirectory(NULL)
+	};
+
+	for (const std::wstring &Directory : Directories) {
+		if (Directory.empty()) {
+			continue;
+		}
+
+		const std::wstring DllPath = Directory + L"\\msdia140.dll";
+		if (GetFileAttributesW(DllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+			continue;
+		}
+
+		IDiaDataSource *RawDataSource = NULL;
+		hr = NoRegCoCreate(DllPath.c_str(),
+			CLSID_DiaSource,
+			__uuidof(IDiaDataSource),
+			reinterpret_cast<void **>(&RawDataSource));
+		if (SUCCEEDED(hr)) {
+			DataSource.Attach(RawDataSource);
+			return hr;
+		}
+
+		LastError = hr;
+	}
+
+	return LastError;
+}
+
+CString BstrToCString(const CComBSTR &Value)
+{
+	return Value.m_str != NULL ? CString(Value.m_str) : CString();
+}
+
+void InsertDeclaratorName(CString &TypeAndDeclarator, LPCWSTR Name)
+{
+	if (Name == NULL) {
+		return;
+	}
+
+	const int Star = TypeAndDeclarator.ReverseFind(L'*');
+	if (Star >= 0) {
+		TypeAndDeclarator.Insert(Star + 1, Name);
+		return;
+	}
+
+	const int Bracket = TypeAndDeclarator.Find(L'[');
+	if (Bracket >= 0) {
+		TypeAndDeclarator.Insert(Bracket, Name);
+		return;
+	}
+
+	TypeAndDeclarator += L" ";
+	TypeAndDeclarator += Name;
+}
+
+CString VariantToCString(const VARIANT &Value, bool AsHex = false)
+{
+	CString Text;
+	switch (Value.vt) {
+	case VT_EMPTY:
+	case VT_NULL:
+		return Text;
+	case VT_BSTR:
+		if (Value.bstrVal != NULL) {
+			Text = Value.bstrVal;
+		}
+		return Text;
+	case VT_BOOL:
+		return BOOL_STR(Value.boolVal != VARIANT_FALSE);
+	case VT_I1:
+		AsHex ? Text.Format(L"0x%02X", static_cast<unsigned char>(Value.cVal))
+			: Text.Format(L"%d", static_cast<int>(Value.cVal));
+		break;
+	case VT_UI1:
+		AsHex ? Text.Format(L"0x%02X", Value.bVal)
+			: Text.Format(L"%u", Value.bVal);
+		break;
+	case VT_I2:
+		AsHex ? Text.Format(L"0x%04X", static_cast<unsigned short>(Value.iVal))
+			: Text.Format(L"%d", static_cast<int>(Value.iVal));
+		break;
+	case VT_UI2:
+		AsHex ? Text.Format(L"0x%04X", Value.uiVal)
+			: Text.Format(L"%u", Value.uiVal);
+		break;
+	case VT_I4:
+	case VT_INT:
+		AsHex ? Text.Format(L"0x%08X", static_cast<unsigned int>(Value.lVal))
+			: Text.Format(L"%ld", Value.lVal);
+		break;
+	case VT_UI4:
+	case VT_UINT:
+		AsHex ? Text.Format(L"0x%08X", Value.ulVal)
+			: Text.Format(L"%lu", Value.ulVal);
+		break;
+	case VT_I8:
+		AsHex ? Text.Format(L"0x%016I64X", static_cast<ULONGLONG>(Value.llVal))
+			: Text.Format(L"%I64d", Value.llVal);
+		break;
+	case VT_UI8:
+		AsHex ? Text.Format(L"0x%016I64X", Value.ullVal)
+			: Text.Format(L"%I64u", Value.ullVal);
+		break;
+	case VT_R4:
+		Text.Format(L"%.9g", Value.fltVal);
+		break;
+	case VT_R8:
+		Text.Format(L"%.17g", Value.dblVal);
+		break;
+	default:
+		Text.Format(L"VT=0x%04X", Value.vt);
+		break;
+	}
+	return Text;
+}
+
+} // namespace
+
+
+SymLoader::ComInitializer::ComInitializer()
+	: _Result(E_FAIL), _OwnsInitialization(false)
+{
+	_Result = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	if (SUCCEEDED(_Result)) {
+		_OwnsInitialization = true;
+	}
+}
+
+SymLoader::ComInitializer::~ComInitializer()
+{
+	if (_OwnsInitialization) {
+		CoUninitialize();
+	}
+}
+
+SymLoader::SymLoader() = default;
+
+HRESULT SymLoader::Open(LPCWSTR FilePath)
+{
+	if (FilePath == NULL) {
+		return E_INVALIDARG;
+	}
+	if (_DataSource == NULL) {
+		return E_UNEXPECTED;
+	}
+
+	_DiaSession.Release();
+	HRESULT hr = _DataSource->loadDataFromPdb(FilePath);
+	ATLASSERT(HR_OK(hr));
 	return hr;
 }
 
-IDiaEnumSymbols* SymBase::GetEnum( enum SymTagEnum Symtag /*= SymTagNull*/, LPWSTR Name /*= NULL*/, ULONG Flags /*= nsNone*/ )
+HRESULT SymLoader::GetSymbol(CComPtr<IDiaSymbol> &Symbol)
 {
-	IDiaEnumSymbols *DiaEnumSymbols = NULL;
-	HRESULT hr = _DiaSymbol->findChildren(Symtag, 
-		Name, 
-		Flags, 
-		&DiaEnumSymbols);
+	Symbol.Release();
+	if (_DataSource == NULL) {
+		return E_UNEXPECTED;
+	}
 
+	HRESULT hr = _DataSource->openSession(&_DiaSession);
 	ATLASSERT(HR_OK(hr));
-	return DiaEnumSymbols;
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	hr = _DiaSession->get_globalScope(&Symbol);
+	ATLASSERT(HR_OK(hr));
+	return hr;
 }
 
-ULONG SymBase::GetTag()
+IDiaSymbol *SymLoader::GetSymbol()
 {
-	ULONG SymTag = 0;
+	CComPtr<IDiaSymbol> Symbol;
+	if (FAILED(GetSymbol(Symbol))) {
+		return NULL;
+	}
+	return Symbol.Detach();
+}
+
+HRESULT SymLoader::Init()
+{
+	if (!_ComInitializer.IsUsable()) {
+		return _ComInitializer.Result();
+	}
+	if (_DataSource != NULL) {
+		return S_OK;
+	}
+
+	HRESULT hr = CreateDiaDataSource(_DataSource);
+	ATLASSERT(HR_OK(hr));
+	return hr;
+}
+
+HRESULT SymBase::GetEnum(CComPtr<IDiaEnumSymbols> &Result,
+	enum SymTagEnum Symtag /*= SymTagNull*/,
+	LPCWSTR Name /*= NULL*/,
+	ULONG Flags /*= nsNone*/) const
+{
+	Result.Release();
+	if (_DiaSymbol == NULL) {
+		return E_UNEXPECTED;
+	}
+
+	HRESULT hr = _DiaSymbol->findChildren(Symtag,
+		Name,
+		Flags,
+		&Result);
+	ATLASSERT(HR_OK(hr));
+	return hr;
+}
+
+IDiaEnumSymbols* SymBase::GetEnum(enum SymTagEnum Symtag /*= SymTagNull*/,
+	LPCWSTR Name /*= NULL*/,
+	ULONG Flags /*= nsNone*/) const
+{
+	CComPtr<IDiaEnumSymbols> Result;
+	if (FAILED(GetEnum(Result, Symtag, Name, Flags))) {
+		return NULL;
+	}
+	return Result.Detach();
+}
+
+HRESULT SymBase::GetTag(ULONG &SymTag) const
+{
+	SymTag = SymTagNull;
+	if (_DiaSymbol == NULL) {
+		return E_UNEXPECTED;
+	}
+
 	HRESULT hr = _DiaSymbol->get_symTag(&SymTag);
 	ATLASSERT(HR_OK(hr));
 	return hr;
 }
 
-LPCWSTR SymBase::GetBaseTypeStr( ULONG Index, ULONG Length )
+ULONG SymBase::GetTag() const
+{
+	ULONG SymTag = SymTagNull;
+	GetTag(SymTag);
+	return SymTag;
+}
+
+LPCWSTR SymBase::GetBaseTypeStr( ULONG Index, ULONG Length ) const
 {
 	LPCWSTR BaseTypeStr = NULL;
 
@@ -189,16 +400,26 @@ LPCWSTR SymBase::GetBaseTypeStr( ULONG Index, ULONG Length )
 	case btHresult  : 
 		BaseTypeStr = L"HRESULT";
 		break;
+	case btChar16   :
+		BaseTypeStr = L"CHAR16_T";
+		break;
+	case btChar32   :
+		BaseTypeStr = L"CHAR32_T";
+		break;
+	case btChar8    :
+		BaseTypeStr = L"CHAR8_T";
+		break;
 	default:
+		BaseTypeStr = L"UNKNOWN";
 		break;
 	}
 
 	return BaseTypeStr;
 }
 
-LPCWSTR SymBase::GetAccessStr( ULONG Index )
+LPCWSTR SymBase::GetAccessStr( ULONG Index ) const
 {
-	LPCWSTR AccessStr = NULL;
+	LPCWSTR AccessStr = L"";
 
 	switch (Index)
 	{
@@ -220,8 +441,15 @@ LPCWSTR SymBase::GetAccessStr( ULONG Index )
 
 SymBase* SymBase::SymNew( IDiaSymbol *Type )
 {
-	enum SymTagEnum Tag = SymTagNull;
-	Type->get_symTag((PDWORD)&Tag);
+	if (Type == NULL) {
+		return NULL;
+	}
+
+	ULONG TagValue = SymTagNull;
+	if (FAILED(Type->get_symTag(&TagValue))) {
+		return NULL;
+	}
+	const enum SymTagEnum Tag = static_cast<enum SymTagEnum>(TagValue);
 
 	SymBase* Ret = NULL;
 	switch (Tag)
@@ -264,17 +492,25 @@ SymBase* SymBase::SymNew( IDiaSymbol *Type )
 	return Ret;
 }
 
+SymBase* SymBase::SymNew(const CComPtr<IDiaSymbol> &Type)
+{
+	if (Type == NULL) {
+		return NULL;
+	}
+	return SymNew(Type.p);
+}
+
 HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 {
 	HRESULT hr;
 	ULONG SymULONG;
 	LPCWSTR SymStr;
-	BSTR SymBStr;
 	BOOL SymBOOL;
-	IDiaSymbol *SymSymbol;
-	IDiaEnumSymbols *SymEnum;
+	CComPtr<IDiaSymbol> SymSymbol;
+	CComPtr<IDiaEnumSymbols> SymEnum;
 	BOOL TableRet;
 	CString Tmp;
+	const int InitialSize = InfoTable.GetSize();
 	
 
 	//
@@ -282,9 +518,11 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	hr = Self()->findChildren(SymTagNull, NULL, nsNone, &SymEnum);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_CHILDREN, BOOL_STR(SymEnum != NULL));
+		LONG ChildCount = 0;
+		const BOOL HasChildren = SymEnum != NULL && SUCCEEDED(SymEnum->get_Count(&ChildCount)) && ChildCount > 0;
+		TableRet = InfoTable.Add(SYMBOL_CHILDREN, BOOL_STR(HasChildren));
 		VERIFY_EXP(TableRet);
-		SymEnum->Release();
+		SymEnum.Release();
 	}
 
 
@@ -347,7 +585,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_ARRAYINDEXTYPE, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 
@@ -418,7 +656,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_CLASSPARENT, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 
@@ -456,9 +694,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// compilerName 
 	//
-	hr = Self()->get_compilerName(&SymBStr);
+	CComBSTR CompilerName;
+	hr = Self()->get_compilerName(&CompilerName);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_COMPILERNAME, SymBStr);
+		TableRet = InfoTable.Add(SYMBOL_COMPILERNAME, BstrToCString(CompilerName));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -480,7 +719,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_CONTAINER, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 
@@ -569,7 +808,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	hr = Self()->get_function(&SymBOOL);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_FARRETURN, BOOL_STR(SymBOOL));
+		TableRet = InfoTable.Add(SYMBOL_FUNCTION, BOOL_STR(SymBOOL));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -580,10 +819,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	GUID SymGuid;
 	hr = Self()->get_guid(&SymGuid);
 	if (HR_OK(hr)) {
-		Tmp.Format(L"{%08X-%04X-%04x-%02X%02X-%02X%02X%02X%02X%02X%02X} ", 
+		Tmp.Format(L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
 			SymGuid.Data1, SymGuid.Data2, SymGuid.Data3, SymGuid.Data4[0],
-			SymGuid.Data4[1], SymGuid.Data4[2], SymGuid.Data4[3], 
-			SymGuid.Data4[4], SymGuid.Data4[5], 
+			SymGuid.Data4[1], SymGuid.Data4[2], SymGuid.Data4[3],
+			SymGuid.Data4[4], SymGuid.Data4[5],
 			SymGuid.Data4[6], SymGuid.Data4[7]);
 
 		TableRet = InfoTable.Add(SYMBOL_GUID, Tmp);
@@ -900,7 +1139,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_LEXICALPARENT, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 	//
@@ -917,9 +1156,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// libraryName 
 	//
-	hr = Self()->get_libraryName(&SymBStr);
+	CComBSTR LibraryName;
+	hr = Self()->get_libraryName(&LibraryName);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_LIBRARYNAME, SymBStr);
+		TableRet = InfoTable.Add(SYMBOL_LIBRARYNAME, BstrToCString(LibraryName));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -980,9 +1220,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// name 
 	//
-	hr = Self()->get_name(&SymBStr);
+	CComBSTR SymbolName;
+	hr = Self()->get_name(&SymbolName);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_NAME, SymBStr);
+		TableRet = InfoTable.Add(SYMBOL_NAME, BstrToCString(SymbolName));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1044,7 +1285,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_OBJECTPOINTERTYPE, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 	
@@ -1117,7 +1358,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	hr = Self()->get_platform(&SymULONG);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_OEMSYMBOLID, GetMachineTypeStr(SymULONG));
+		TableRet = InfoTable.Add(SYMBOL_PLATFORM, GetMachineTypeStr(SymULONG));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1150,9 +1391,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// registerId 
 	//
-	hr = Self()->get_platform(&SymULONG);
+	hr = Self()->get_registerId(&SymULONG);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_REGISTERID, GetMachineTypeStr(SymULONG));
+		Tmp.Format(L"%08X", SymULONG);
+		TableRet = InfoTable.Add(SYMBOL_REGISTERID, Tmp);
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1160,9 +1402,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// relativeVirtualAddress 
 	//
-	hr = Self()->get_platform(&SymULONG);
+	hr = Self()->get_relativeVirtualAddress(&SymULONG);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_RELATIVEVIRTUALADDRESS, GetMachineTypeStr(SymULONG));
+		Tmp.Format(L"%08X", SymULONG);
+		TableRet = InfoTable.Add(SYMBOL_RELATIVEVIRTUALADDRESS, Tmp);
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1202,9 +1445,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// sourceFileName 
 	//
-	hr = Self()->get_sourceFileName(&SymBStr);
+	CComBSTR SourceFileName;
+	hr = Self()->get_sourceFileName(&SourceFileName);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_SOURCEFILENAME, SymBStr);
+		TableRet = InfoTable.Add(SYMBOL_SOURCEFILENAME, BstrToCString(SourceFileName));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1212,9 +1456,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// symbolsFileName  
 	//
-	hr = Self()->get_symbolsFileName(&SymBStr);
+	CComBSTR SymbolsFileName;
+	hr = Self()->get_symbolsFileName(&SymbolsFileName);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_SYMBOLSFILENAME, SymBStr);
+		TableRet = InfoTable.Add(SYMBOL_SYMBOLSFILENAME, BstrToCString(SymbolsFileName));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1246,7 +1491,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	hr = Self()->get_targetOffset(&SymULONG);
 	if (HR_OK(hr)) {
 		Tmp.Format(L"%08X", SymULONG);
-		TableRet = InfoTable.Add(SYMBOL_SYMINDEXID, Tmp);
+		TableRet = InfoTable.Add(SYMBOL_TARGETOFFSET, Tmp);
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1301,7 +1546,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	hr = Self()->get_thunkOrdinal(&SymULONG);
 	if (HR_OK(hr)) {
 		Tmp.Format(L"%08X", SymULONG);
-		TableRet = InfoTable.Add(SYMBOL_THISADJUST, Tmp);
+		TableRet = InfoTable.Add(SYMBOL_THUNKORDINAL, Tmp);
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1335,7 +1580,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_TYPE, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 
@@ -1383,9 +1628,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// undecoratedName 
 	//
-	hr = Self()->get_undecoratedName(&SymBStr);
+	CComBSTR UndecoratedName;
+	hr = Self()->get_undecoratedName(&UndecoratedName);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_UNDECORATEDNAME, SymBStr);
+		TableRet = InfoTable.Add(SYMBOL_UNDECORATEDNAME, BstrToCString(UndecoratedName));
 		VERIFY_EXP(TableRet);
 	}
 	
@@ -1408,11 +1654,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	//
 	// value 
 	//
-	VARIANT SymVar;
-	SymVar.vt = VT_EMPTY;
+	CComVariant SymVar;
 	hr = Self()->get_value(&SymVar);
 	if (HR_OK(hr)) {
-		TableRet = InfoTable.Add(SYMBOL_VALUE, L"TRUE");
+		TableRet = InfoTable.Add(SYMBOL_VALUE, VariantToCString(SymVar));
 		VERIFY_EXP(TableRet);
 	}
 
@@ -1488,7 +1733,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_VIRTUALBASETABLETYPE, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 
@@ -1499,7 +1744,7 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	if (HR_OK(hr)) {
 		TableRet = InfoTable.Add(SYMBOL_VIRTUALTABLESHAPE, BOOL_STR(SymSymbol != NULL));
 		VERIFY_EXP(TableRet);
-		SymSymbol->Release();
+
 	}
 
 
@@ -1527,10 +1772,10 @@ HRESULT SymBase::GetInfoTable( SymbolInfoTable &InfoTable )
 	DisplayInfo(InfoTable);
 #endif
 	
-	return S_OK;
+	return InfoTable.GetSize() > InitialSize ? S_OK : E_FAIL;
 }
 
-LPCWSTR SymBase::GetLanguageStr( ULONG Index )
+LPCWSTR SymBase::GetLanguageStr( ULONG Index ) const
 {
 	LPCWSTR Lan[] = {
 		L"CV_CFL_C",
@@ -1549,12 +1794,22 @@ LPCWSTR SymBase::GetLanguageStr( ULONG Index )
 		L"CV_CFL_JAVA",
 		L"CV_CFL_JSCRIPT",
 		L"CV_CFL_MSIL",
+		L"CV_CFL_HLSL",
+		L"CV_CFL_OBJC",
+		L"CV_CFL_OBJCXX",
+		L"CV_CFL_SWIFT",
+		L"CV_CFL_ALIASOBJ",
+		L"CV_CFL_RUST",
+		L"CV_CFL_GO",
 	};
 
+	if (Index >= _countof(Lan)) {
+		return L"UNKNOWN";
+	}
 	return Lan[Index];
 }
 
-LPCWSTR SymBase::GetLocationTypeStr( ULONG Index )
+LPCWSTR SymBase::GetLocationTypeStr( ULONG Index ) const
 {
 	LPCWSTR LocationTypeStr[] = {
 		L"LocIsNull",
@@ -1568,12 +1823,16 @@ LPCWSTR SymBase::GetLocationTypeStr( ULONG Index )
 		L"LocIsIlRel",
 		L"LocInMetaData",
 		L"LocIsConstant",
+		L"LocIsRegRelAliasIndir",
 	};
 
+	if (Index >= _countof(LocationTypeStr)) {
+		return L"UNKNOWN";
+	}
 	return LocationTypeStr[Index];
 }
 
-LPCWSTR SymBase::GetMachineTypeStr( ULONG Index )
+LPCWSTR SymBase::GetMachineTypeStr( ULONG Index ) const
 {
 	LPCWSTR MachineTypeStr = NULL;
 
@@ -1634,15 +1893,25 @@ LPCWSTR SymBase::GetMachineTypeStr( ULONG Index )
 	case CV_CFL_X64: MachineTypeStr = L"CV_CFL_X64"; break;
 	case CV_CFL_EBC: MachineTypeStr = L"CV_CFL_EBC"; break;
 	case CV_CFL_THUMB: MachineTypeStr = L"CV_CFL_THUMB"; break;
+	case CV_CFL_PPCBE: MachineTypeStr = L"CV_CFL_PPCBE"; break;
+	case CV_CFL_ARM7: MachineTypeStr = L"CV_CFL_ARM7"; break;
+	case CV_CFL_ARMNT: MachineTypeStr = L"CV_CFL_ARMNT"; break;
+	case CV_CFL_ARM64: MachineTypeStr = L"CV_CFL_ARM64"; break;
+	case CV_CFL_HYBRID_X86_ARM64: MachineTypeStr = L"CV_CFL_HYBRID_X86_ARM64"; break;
+	case CV_CFL_ARM64EC: MachineTypeStr = L"CV_CFL_ARM64EC"; break;
+	case CV_CFL_ARM64X: MachineTypeStr = L"CV_CFL_ARM64X"; break;
+	case CV_CFL_UNKNOWN: MachineTypeStr = L"CV_CFL_UNKNOWN"; break;
+	case CV_CFL_D3D11_SHADER: MachineTypeStr = L"CV_CFL_D3D11_SHADER"; break;
 
 	default:
+		MachineTypeStr = L"UNKNOWN";
 		break;
 	}
 
 	return MachineTypeStr;
 }
 
-LPCWSTR SymBase::GetSymTagStr( ULONG Index )
+LPCWSTR SymBase::GetSymTagStr( ULONG Index ) const
 {
 	LPCWSTR SymTagStr[] = {
 		L"SymTagNull",
@@ -1675,20 +1944,42 @@ LPCWSTR SymBase::GetSymTagStr( ULONG Index )
 		L"SymTagThunk",
 		L"SymTagCustomType",
 		L"SymTagManagedType",
-		L"SymTagDimension"
+		L"SymTagDimension",
+		L"SymTagCallSite",
+		L"SymTagInlineSite",
+		L"SymTagBaseInterface",
+		L"SymTagVectorType",
+		L"SymTagMatrixType",
+		L"SymTagHLSLType",
+		L"SymTagCaller",
+		L"SymTagCallee",
+		L"SymTagExport",
+		L"SymTagHeapAllocationSite",
+		L"SymTagCoffGroup",
+		L"SymTagInlinee",
+		L"SymTagTaggedUnionCase",
+		L"SymTagMax"
 	};
 
+	if (Index >= _countof(SymTagStr)) {
+		return L"UNKNOWN";
+	}
 	return SymTagStr[Index];
 }
 
-LPCWSTR SymBase::GetUdtKindStr( ULONG Index )
+LPCWSTR SymBase::GetUdtKindStr( ULONG Index ) const
 {
 	LPCWSTR UdtKindStr[] = {
 		L"UdtStruct",
 		L"UdtClass",
-		L"UdtUnion"
+		L"UdtUnion",
+		L"UdtInterface",
+		L"UdtTaggedUnion"
 	};
 
+	if (Index >= _countof(UdtKindStr)) {
+		return L"UNKNOWN";
+	}
 	return UdtKindStr[Index];
 }
 
@@ -1703,7 +1994,7 @@ void SymBase::DisplayInfo( SymbolInfoTable &InfoTable )
 	}
 }
 
-LPCWSTR SymBase::GetSymbolTypeStr( ULONG Index )
+LPCWSTR SymBase::GetSymbolTypeStr( ULONG Index ) const
 {
 	LPCWSTR SymbolTypeStr[] = {
 		L"SYMBOL_CHILDREN",
@@ -1836,60 +2127,93 @@ LPCWSTR SymBase::GetSymbolTypeStr( ULONG Index )
 		L"SYMBOL_VOLATILETYPE",
 	};
 
+	if (Index >= _countof(SymbolTypeStr)) {
+		return L"UNKNOWN";
+	}
 	return SymbolTypeStr[Index];
 }
 
-LPCWSTR SymBase::GetCallingConventionStr( ULONG Index )
+LPCWSTR SymBase::GetCallingConventionStr( ULONG Index ) const
 {
-	LPCWSTR CallStr = NULL;
+	LPCWSTR CallStr = L"UNKNOWN_CALL";
 	switch (Index)
 	{
 	case CV_CALL_NEAR_C: CallStr = L"__cdecl"; break;
+	case CV_CALL_FAR_C: CallStr = L"__far __cdecl"; break;
+	case CV_CALL_NEAR_PASCAL: CallStr = L"__pascal"; break;
+	case CV_CALL_FAR_PASCAL: CallStr = L"__far __pascal"; break;
 	case CV_CALL_NEAR_FAST: CallStr = L"__fastcall"; break;
+	case CV_CALL_FAR_FAST: CallStr = L"__far __fastcall"; break;
+	case CV_CALL_SKIPPED: CallStr = L"SKIPPED"; break;
 	case CV_CALL_NEAR_STD: CallStr = L"__stdcall"; break;
+	case CV_CALL_FAR_STD: CallStr = L"__far __stdcall"; break;
 	case CV_CALL_NEAR_SYS: CallStr = L"SYSCALL"; break;
+	case CV_CALL_FAR_SYS: CallStr = L"FAR_SYSCALL"; break;
 	case CV_CALL_THISCALL: CallStr = L"__thiscall"; break;
+	case CV_CALL_MIPSCALL: CallStr = L"MIPSCALL"; break;
+	case CV_CALL_GENERIC: CallStr = L"GENERIC"; break;
+	case CV_CALL_ALPHACALL: CallStr = L"ALPHACALL"; break;
+	case CV_CALL_PPCCALL: CallStr = L"PPCCALL"; break;
+	case CV_CALL_SHCALL: CallStr = L"SHCALL"; break;
+	case CV_CALL_ARMCALL: CallStr = L"ARMCALL"; break;
+	case CV_CALL_AM33CALL: CallStr = L"AM33CALL"; break;
+	case CV_CALL_TRICALL: CallStr = L"TRICALL"; break;
+	case CV_CALL_SH5CALL: CallStr = L"SH5CALL"; break;
+	case CV_CALL_M32RCALL: CallStr = L"M32RCALL"; break;
 	case CV_CALL_CLRCALL: CallStr = L"__clrcall"; break;
+	case CV_CALL_INLINE: CallStr = L"INLINE"; break;
+	case CV_CALL_NEAR_VECTOR: CallStr = L"__vectorcall"; break;
+	case CV_CALL_SWIFT: CallStr = L"__swiftcall"; break;
 	default: break;
 	}
 
-	ATLASSERT(CallStr != NULL);
 	return CallStr;
 }
 
 HRESULT SymBase::GetDecl( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
-	return S_OK;
+	return E_NOTIMPL;
 }
 
 HRESULT SymBase::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
-	return S_OK;
+	return E_NOTIMPL;
 }
 
 void SymBase::EnumEveryChild()
 {
 	CString Info;
-	IDiaEnumSymbols *SymChildren = GetEnum(SymTagNull);
-	if (SymChildren != NULL) {
+	CComPtr<IDiaEnumSymbols> SymChildren;
+	if (SUCCEEDED(GetEnum(SymChildren, SymTagNull)) && SymChildren != NULL) {
 		SymEnumTool SymEnumInst(SymChildren);
-		int i;
-		for (i = 0; i < SymEnumInst.GetCount(); i++) {
-			CAutoPtr<SymBase> p(SymBase::SymNew(SymEnumInst.Item(i)));
-			p->GetDecl(Info);
+		LONG Count = 0;
+		if (FAILED(SymEnumInst.GetCount(Count))) {
+			return;
+		}
+		for (LONG i = 0; i < Count; ++i) {
+			CComPtr<IDiaSymbol> Child;
+			if (FAILED(SymEnumInst.Item(static_cast<ULONG>(i), Child)) || Child == NULL) {
+				continue;
+			}
+			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
+			if (p != NULL) {
+				p->GetDecl(Info);
+			}
 		}
 	}
 }
 
-LPCWSTR SymBase::GetDataKindStr( ULONG Index )
+LPCWSTR SymBase::GetDataKindStr( ULONG Index ) const
 {
 	LPCWSTR DataKindStr[] = {
 		L"DataIsUnknown",
@@ -1904,99 +2228,186 @@ LPCWSTR SymBase::GetDataKindStr( ULONG Index )
 		L"DataIsConstant"
 	};
 
+	if (Index >= _countof(DataKindStr)) {
+		return L"UNKNOWN";
+	}
 	return DataKindStr[Index];
 }
 
-LONG SymEnumTool::GetCount()
+HRESULT SymEnumTool::GetCount(LONG &Count) const
 {
-	LONG Count = 0;
+	Count = 0;
+	if (_DiaEnumSymbols == NULL) {
+		return E_UNEXPECTED;
+	}
+
 	HRESULT hr = _DiaEnumSymbols->get_Count(&Count);
-	ATLASSERT(HR_OK(hr));
-	return Count;
-}
-
-IDiaSymbol* SymEnumTool::Item( ULONG Index )
-{
-	IDiaSymbol* SubSymbol = NULL;
-	HRESULT hr = _DiaEnumSymbols->Item(Index, &SubSymbol);
-	ATLASSERT(HR_OK(hr));
-	return SubSymbol;
-}
-
-HRESULT SymEnumTool::Skip( ULONG Celt )
-{
-	HRESULT hr = _DiaEnumSymbols->Skip(Celt);
 	ATLASSERT(HR_OK(hr));
 	return hr;
 }
 
-HRESULT SymEnumTool::Reset()
+LONG SymEnumTool::GetCount() const
 {
-	HRESULT hr = _DiaEnumSymbols->Reset();
+	LONG Count = 0;
+	GetCount(Count);
+	return Count;
+}
+
+HRESULT SymEnumTool::Item(ULONG Index, CComPtr<IDiaSymbol> &Symbol) const
+{
+	Symbol.Release();
+	if (_DiaEnumSymbols == NULL) {
+		return E_UNEXPECTED;
+	}
+
+	HRESULT hr = _DiaEnumSymbols->Item(Index, &Symbol);
 	ATLASSERT(HR_OK(hr));
+	return hr;
+}
+
+IDiaSymbol* SymEnumTool::Item( ULONG Index )
+{
+	CComPtr<IDiaSymbol> Symbol;
+	if (FAILED(Item(Index, Symbol))) {
+		return NULL;
+	}
+	return Symbol.Detach();
+}
+
+HRESULT SymEnumTool::Next(CComPtr<IDiaSymbol> &Symbol) const
+{
+	Symbol.Release();
+	if (_DiaEnumSymbols == NULL) {
+		return E_UNEXPECTED;
+	}
+
+	ULONG Fetched = 0;
+	HRESULT hr = _DiaEnumSymbols->Next(1, &Symbol, &Fetched);
+	ATLASSERT(SUCCEEDED(hr));
+	if (hr == S_OK && Fetched == 0) {
+		return S_FALSE;
+	}
 	return hr;
 }
 
 IDiaSymbol* SymEnumTool::Next()
 {
-	IDiaSymbol* SubSymbol = NULL;
-	ULONG Celt;
-	HRESULT hr = _DiaEnumSymbols->Next(1, &SubSymbol, &Celt);
+	CComPtr<IDiaSymbol> Symbol;
+	if (FAILED(Next(Symbol))) {
+		return NULL;
+	}
+	return Symbol.Detach();
+}
+
+HRESULT SymEnumTool::Skip( ULONG Celt ) const
+{
+	if (_DiaEnumSymbols == NULL) {
+		return E_UNEXPECTED;
+	}
+
+	HRESULT hr = _DiaEnumSymbols->Skip(Celt);
 	ATLASSERT(HR_OK(hr));
-	return SubSymbol;
+	return hr;
+}
+
+HRESULT SymEnumTool::Reset() const
+{
+	if (_DiaEnumSymbols == NULL) {
+		return E_UNEXPECTED;
+	}
+
+	HRESULT hr = _DiaEnumSymbols->Reset();
+	ATLASSERT(HR_OK(hr));
+	return hr;
 }
 
 
 HRESULT SymFunc::GetDecl(CString &Info)
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	BSTR Name;
+	CComBSTR Name;
 	HRESULT hr = Self()->get_name(&Name);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
 	CComPtr<IDiaSymbol> FuncType;
 	hr = Self()->get_type(&FuncType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || FuncType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
- 
+
 	CString FuncTypeStr;
 	CAutoPtr<SymBase> SubSym(SymBase::SymNew(FuncType));
+	if (SubSym == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SubSym->GetDecl(FuncTypeStr);
 	ATLASSERT(HR_OK(hr));
+	if (FAILED(hr)) {
+		return hr;
+	}
 
 	CString ArgsStr = L"(";
-	IDiaEnumSymbols *SymChildren = GetEnum(SymTagData);
+	CComPtr<IDiaEnumSymbols> SymChildren;
+	hr = GetEnum(SymChildren, SymTagData);
+	if (FAILED(hr)) {
+		return hr;
+	}
 	if (SymChildren != NULL) {
 		SymEnumTool SymEnumInst(SymChildren);
-		int i;
-		for (i = 0; i < SymEnumInst.GetCount(); i++) {
-			CAutoPtr<SymBase> p(SymBase::SymNew(SymEnumInst.Item(i)));
-			ULONG DataKind;
-			CString ArgStr;
-			hr = p->Self()->get_dataKind(&DataKind);
-			if (HR_OK(hr) && DataKind == DataIsParam) {
-				if (i != 0) {
-					ArgsStr += L", ";
-				}
-				p->GetDecl(ArgStr);
-				ArgsStr += ArgStr;
+		LONG Count = 0;
+		hr = SymEnumInst.GetCount(Count);
+		if (FAILED(hr)) {
+			return hr;
+		}
+
+		bool HasArgument = false;
+		for (LONG i = 0; i < Count; ++i) {
+			CComPtr<IDiaSymbol> Child;
+			if (FAILED(SymEnumInst.Item(static_cast<ULONG>(i), Child)) || Child == NULL) {
+				continue;
 			}
+
+			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
+			if (p == NULL) {
+				return E_OUTOFMEMORY;
+			}
+
+			ULONG DataKind = DataIsUnknown;
+			hr = p->Self()->get_dataKind(&DataKind);
+			if (FAILED(hr)) {
+				return hr;
+			}
+			if (DataKind != DataIsParam) {
+				continue;
+			}
+
+			CString ArgStr;
+			hr = p->GetDecl(ArgStr);
+			if (FAILED(hr)) {
+				return hr;
+			}
+			if (HasArgument) {
+				ArgsStr += L", ";
+			}
+			ArgsStr += ArgStr;
+			HasArgument = true;
 		}
 	}
 	ArgsStr += L")";
 
-	Info = FuncTypeStr + L" " + Name + L" " + ArgsStr + L";";
+	CString SymbolName(Name.m_str != NULL ? Name.m_str : L"");
+	Info = FuncTypeStr + L" " + SymbolName + ArgsStr + L";";
 
-	return hr;
+	return S_OK;
 }
 
 HRESULT SymFunc::GetDef( CString &Info )
@@ -2006,72 +2417,99 @@ HRESULT SymFunc::GetDef( CString &Info )
 
 HRESULT SymFuncType::GetDecl(CString &Info)
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
 	CComPtr<IDiaSymbol> FuncBaseType;
-
 	HRESULT hr = Self()->get_type(&FuncBaseType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || FuncBaseType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CAutoPtr<SymBase> SubSym(SymBase::SymNew(FuncBaseType));
+	if (SubSym == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SubSym->GetDecl(Info);
 	ATLASSERT(HR_OK(hr));
-	
 	return hr;
 }
 
 HRESULT SymFuncType::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
 	CComPtr<IDiaSymbol> FuncBaseType;
-
 	HRESULT hr = Self()->get_type(&FuncBaseType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || FuncBaseType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CAutoPtr<SymBase> SubSym(SymBase::SymNew(FuncBaseType));
+	if (SubSym == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SubSym->GetDecl(Info);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-	Info += L" (";
-
-	ULONG CallConv;
+	ULONG CallConv = CV_CALL_NEAR_C;
 	hr = Self()->get_callingConvention(&CallConv);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
+	Info += L" (";
 	Info += GetCallingConventionStr(CallConv);
 	Info += L" *)";
 
-	IDiaEnumSymbols *SymChildren = GetEnum(SymTagFunctionArgType);
 	Info += L"(";
+	CComPtr<IDiaEnumSymbols> SymChildren;
+	hr = GetEnum(SymChildren, SymTagFunctionArgType);
+	if (FAILED(hr)) {
+		return hr;
+	}
 	if (SymChildren != NULL) {
 		SymEnumTool SymEnumInst(SymChildren);
-		int i;
-		for (i = 0; i < SymEnumInst.GetCount(); i++) {
-			if (i != 0) {
+		LONG Count = 0;
+		hr = SymEnumInst.GetCount(Count);
+		if (FAILED(hr)) {
+			return hr;
+		}
+
+		bool HasArgument = false;
+		for (LONG i = 0; i < Count; ++i) {
+			CComPtr<IDiaSymbol> Child;
+			if (FAILED(SymEnumInst.Item(static_cast<ULONG>(i), Child)) || Child == NULL) {
+				continue;
+			}
+
+			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
+			if (p == NULL) {
+				return E_OUTOFMEMORY;
+			}
+
+			CString Argument;
+			hr = p->GetDecl(Argument);
+			if (FAILED(hr)) {
+				return hr;
+			}
+			if (HasArgument) {
 				Info += L", ";
 			}
-			CString Tmp;
-			CAutoPtr<SymBase> p(SymBase::SymNew(SymEnumInst.Item(i)));
-			p->GetDecl(Tmp);
-			Info += Tmp;
+			Info += Argument;
+			HasArgument = true;
 		}
 	}
 	Info += L")";
@@ -2085,9 +2523,13 @@ HRESULT SymBaseType::GetDecl(CString &Info)
 }
 
 
-LPCWSTR SymBaseType::GetBaseTypeStr( CComPtr<IDiaSymbol> BaseType )
+LPCWSTR SymBaseType::GetBaseTypeStr(const CComPtr<IDiaSymbol> &BaseType) const
 {
-	ULONG Index;
+	if (BaseType == NULL) {
+		return NULL;
+	}
+
+	ULONG Index = btNoType;
 
 	HRESULT hr = BaseType->get_baseType(&Index);
 	ATLASSERT(HR_OK(hr));
@@ -2107,6 +2549,7 @@ LPCWSTR SymBaseType::GetBaseTypeStr( CComPtr<IDiaSymbol> BaseType )
 
 HRESULT SymBaseType::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
@@ -2126,229 +2569,318 @@ HRESULT SymBaseType::GetDef( CString &Info )
 
 HRESULT SymFuncArgType::GetDecl( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	IDiaSymbol *SymType;
+	CComPtr<IDiaSymbol> SymType;
 	HRESULT hr = Self()->get_type(&SymType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || SymType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (SymSub == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SymSub->GetDecl(Info);
-
+	ATLASSERT(HR_OK(hr));
 	return hr;
 }
 
 HRESULT SymFuncArgType::GetDef( CString &Info )
 {
-	ATLASSERT(0);
-	return E_FAIL;
+	Info.Empty();
+	return E_NOTIMPL;
 }
 
 HRESULT SymPointerType::GetDecl( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	IDiaSymbol *SymType;
+	CComPtr<IDiaSymbol> SymType;
 	HRESULT hr = Self()->get_type(&SymType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || SymType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
-	hr = SymSub->GetDecl(Info);
-	ATLASSERT(HR_OK(hr));
-	if (HR_OK(hr)) {
-		Info += L" *";
+	if (SymSub == NULL) {
+		return E_OUTOFMEMORY;
 	}
 
+	ULONG Tag = SymTagNull;
+	hr = SymSub->GetTag(Tag);
+	if (FAILED(hr)) {
+		return hr;
+	}
 
+	if (Tag == SymTagFunctionType) {
+		hr = SymSub->GetDef(Info);
+	} else {
+		hr = SymSub->GetDecl(Info);
+		if (SUCCEEDED(hr) && Tag == SymTagArrayType) {
+			const int Bracket = Info.Find(L'[');
+			if (Bracket >= 0) {
+				Info.Insert(Bracket, L"(*)");
+			} else {
+				Info += L" *";
+			}
+		} else if (SUCCEEDED(hr)) {
+			Info += L" *";
+		}
+	}
+
+	ATLASSERT(HR_OK(hr));
 	return hr;
 }
 
 HRESULT SymPointerType::GetDef( CString &Info )
 {
-	ATLASSERT(0);
-	return E_FAIL;
+	Info.Empty();
+	return E_NOTIMPL;
 }
 
 HRESULT SymUDT::GetDecl( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	BSTR DeclName;
+	CComBSTR DeclName;
 	HRESULT hr = Self()->get_name(&DeclName);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-	CString Name(DeclName);
-	if (Name == L"<unnamed-tag>") {
-		hr = GetDef(Name);
-		ATLASSERT(HR_OK(hr));
+	CString Name(DeclName.m_str != NULL ? DeclName.m_str : L"");
+	if (Name.IsEmpty() || Name == L"<unnamed-tag>") {
+		return GetDef(Info);
 	}
 
-	ULONG UdtKind;
-	CString UdtName;
+	ULONG UdtKind = UdtStruct;
 	hr = Self()->get_udtKind(&UdtKind);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-
-	if (UdtKind == UdtStruct) {
+	LPCWSTR UdtName = L"struct";
+	switch (UdtKind) {
+	case UdtStruct:
 		UdtName = L"struct";
-	}
-	else if (UdtKind == UdtUnion) {
-		UdtName = L"union";
-	}
-	else {
+		break;
+	case UdtClass:
 		UdtName = L"class";
+		break;
+	case UdtUnion:
+		UdtName = L"union";
+		break;
+	case UdtInterface:
+		UdtName = L"interface";
+		break;
+	case UdtTaggedUnion:
+		UdtName = L"tagged union";
+		break;
+	default:
+		UdtName = L"UNKNOWN";
+		break;
 	}
 
-	Info = UdtName + L" " +Name;
+	Info = UdtName;
+	Info += L" ";
+	Info += Name;
 	return S_OK;
 }
 
 HRESULT SymUDT::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
+	ULONG UdtKind = UdtStruct;
+	HRESULT hr = Self()->get_udtKind(&UdtKind);
+	ATLASSERT(HR_OK(hr));
+	if (FAILED(hr)) {
+		return hr;
+	}
 
-	ULONG UdtKind;
-	CString Name;
+	CComBSTR DeclName;
+	hr = Self()->get_name(&DeclName);
+	ATLASSERT(HR_OK(hr));
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	CString Name(DeclName.m_str != NULL ? DeclName.m_str : L"");
+	LPCWSTR UdtName = L"struct";
+	switch (UdtKind) {
+	case UdtStruct:
+		UdtName = L"struct";
+		break;
+	case UdtClass:
+		UdtName = L"class";
+		break;
+	case UdtUnion:
+		UdtName = L"union";
+		break;
+	case UdtInterface:
+		UdtName = L"interface";
+		break;
+	case UdtTaggedUnion:
+		UdtName = L"tagged union";
+		break;
+	default:
+		UdtName = L"UNKNOWN";
+		break;
+	}
+
+	CString TypeName = UdtName;
+	if (!Name.IsEmpty() && Name != L"<unnamed-tag>") {
+		TypeName += L" ";
+		TypeName += Name;
+	}
+
 	CString PublicStr;
-	CString ProtectStr;
+	CString ProtectedStr;
 	CString PrivateStr;
-
-	BSTR DeclName;
-	HRESULT hr = Self()->get_name(&DeclName);
-	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	CComPtr<IDiaEnumSymbols> SymChildren;
+	hr = GetEnum(SymChildren, SymTagNull);
+	if (FAILED(hr)) {
 		return hr;
 	}
-
-	if (CString(DeclName) != L"<unnamed-tag>") {
-		hr = GetDecl(Name);
-		ATLASSERT(HR_OK(hr));
-		if (HR_NOK(hr)) {
-			return hr;
-		}
-		
-	}
-	
-	hr = Self()->get_udtKind(&UdtKind);
-	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
-	}
-
-
-	IDiaEnumSymbols *SymChildren = GetEnum(SymTagNull);
 	if (SymChildren != NULL) {
 		SymEnumTool SymEnumInst(SymChildren);
-		int i;
-		for (i = 0; i < SymEnumInst.GetCount(); i++) {
-
-			CString Tmp;
-			ULONG Access = CV_public;
-			CAutoPtr<SymBase> p(SymBase::SymNew(SymEnumInst.Item(i)));
-
-			LONG Offset;
-			CString OffsetStr;
-			p->Self()->get_offset(&Offset);
-			OffsetStr.Format(L" // +0x%X", Offset);
-
-			p->GetDecl(Tmp);
-			p->Self()->get_access(&Access);
-			if (Access == CV_public) {
-				PublicStr += L"\t";
-				PublicStr += Tmp + L";";
-				PublicStr += OffsetStr;
-				PublicStr += L"\r\n";
-			}
-			else if (Access == CV_protected) {
-				ProtectStr += L"\t";
-				ProtectStr += Tmp + L";";
-				ProtectStr += OffsetStr;
-				ProtectStr += L"\r\n";
-			}
-			else {
-				PrivateStr += L"\t";
-				PrivateStr += Tmp + L";";
-				PrivateStr += OffsetStr;
-				PrivateStr += L"\r\n";
-			}
-
+		LONG Count = 0;
+		hr = SymEnumInst.GetCount(Count);
+		if (FAILED(hr)) {
+			return hr;
 		}
 
+		for (LONG i = 0; i < Count; ++i) {
+			CComPtr<IDiaSymbol> Child;
+			if (FAILED(SymEnumInst.Item(static_cast<ULONG>(i), Child)) || Child == NULL) {
+				continue;
+			}
+
+			CAutoPtr<SymBase> p(SymBase::SymNew(Child));
+			if (p == NULL) {
+				return E_OUTOFMEMORY;
+			}
+
+			ULONG Tag = SymTagNull;
+			hr = p->GetTag(Tag);
+			if (FAILED(hr)) {
+				return hr;
+			}
+			if (Tag != SymTagData && Tag != SymTagFunction && Tag != SymTagUDT &&
+				Tag != SymTagEnum && Tag != SymTagTypedef && Tag != SymTagBaseClass) {
+				continue;
+			}
+
+			CString Member;
+			hr = p->GetDecl(Member);
+			if (FAILED(hr) || Member.IsEmpty()) {
+				continue;
+			}
+
+			if (Member.GetAt(Member.GetLength() - 1) != L';') {
+				Member += L";";
+			}
+
+			if (Tag == SymTagData) {
+				LONG Offset = 0;
+				if (SUCCEEDED(p->Self()->get_offset(&Offset))) {
+					CString OffsetStr;
+					OffsetStr.Format(L" // +0x%X", static_cast<unsigned int>(Offset));
+					Member += OffsetStr;
+				}
+			}
+
+			ULONG Access = (UdtKind == UdtClass || UdtKind == UdtInterface) ? CV_private : CV_public;
+			if (FAILED(p->Self()->get_access(&Access)) || Access == 0) {
+				Access = (UdtKind == UdtClass || UdtKind == UdtInterface) ? CV_private : CV_public;
+			}
+
+			CString *Destination = &PrivateStr;
+			if (Access == CV_public) {
+				Destination = &PublicStr;
+			} else if (Access == CV_protected) {
+				Destination = &ProtectedStr;
+			}
+
+			*Destination += L"\t";
+			*Destination += Member;
+			*Destination += L"\r\n";
+		}
 	}
 
-	ULONGLONG Length;
-	CString LengthStr;
+	ULONGLONG Length = 0;
 	hr = Self()->get_length(&Length);
 	ATLASSERT(HR_OK(hr));
-	LengthStr.Format(L" { // Size 0x%I64X\r\n", Length);
-	Info = Name + LengthStr;
-	if (UdtKind == UdtClass) {
-		
-		if (PublicStr.GetLength() != 0) {
-			Info += L"public:\r\n";
-			Info += PublicStr;
-		}
-
-		if (ProtectStr.GetLength() != 0) {
-			Info += L"protect:\r\n";
-			Info += ProtectStr;
-		}
-
-		if (PrivateStr.GetLength() != 0) {
-			Info += L"private:\r\n";
-			Info += PrivateStr;
-		}
+	if (FAILED(hr)) {
+		return hr;
 	}
-	else {
+
+	CString LengthStr;
+	LengthStr.Format(L" { // Size 0x%I64X\r\n", Length);
+	Info = TypeName + LengthStr;
+
+	const BOOL NeedsAccessLabels = (UdtKind == UdtClass || UdtKind == UdtInterface) ||
+		!ProtectedStr.IsEmpty() || !PrivateStr.IsEmpty();
+	if (!PublicStr.IsEmpty()) {
+		if (NeedsAccessLabels) {
+			Info += L"public:\r\n";
+		}
 		Info += PublicStr;
+	}
+	if (!ProtectedStr.IsEmpty()) {
+		Info += L"protected:\r\n";
+		Info += ProtectedStr;
+	}
+	if (!PrivateStr.IsEmpty()) {
+		Info += L"private:\r\n";
+		Info += PrivateStr;
 	}
 
 	Info += L"};";
-
 	return S_OK;
 }
 
 HRESULT SymEnum::GetDecl( CString &Info )
 {
-	BSTR Name;
+	Info.Empty();
+	CComBSTR Name;
 	HRESULT hr = Self()->get_name(&Name);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
 	Info = L"enum ";
-	Info += Name;
+	if (Name.m_str != NULL) {
+		Info += Name.m_str;
+	}
 	return S_OK;
 }
 
 HRESULT SymEnum::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
@@ -2357,39 +2889,62 @@ HRESULT SymEnum::GetDef( CString &Info )
 	CString Name;
 	HRESULT hr = GetDecl(Name);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-
 	Info = Name + L" {\r\n";
-	IDiaEnumSymbols *SymChildren = GetEnum(SymTagNull);
+	CComPtr<IDiaEnumSymbols> SymChildren;
+	hr = GetEnum(SymChildren, SymTagNull);
+	if (FAILED(hr)) {
+		return hr;
+	}
 	if (SymChildren != NULL) {
 		SymEnumTool SymEnumInst(SymChildren);
-		int i;
-		for (i = 0; i < SymEnumInst.GetCount(); i++) {
-
-			BSTR TmpName;
-			CComVariant TmpValue;
-			CString NameStr;
-			CAutoPtr<SymBase> p(SymBase::SymNew(SymEnumInst.Item(i)));
-			p->Self()->get_name(&TmpName);
-			p->Self()->get_value(&TmpValue);
-			Info += L"\t";
-			Info += TmpName;
-			NameStr.Format(L" = 0x%08X", TmpValue.vt == VT_I4 ? TmpValue.lVal : TmpValue.iVal);
-			Info += NameStr;
-			Info += L",\r\n";
+		LONG Count = 0;
+		hr = SymEnumInst.GetCount(Count);
+		if (FAILED(hr)) {
+			return hr;
 		}
 
+		bool HasMember = false;
+		for (LONG i = 0; i < Count; ++i) {
+			CComPtr<IDiaSymbol> Child;
+			if (FAILED(SymEnumInst.Item(static_cast<ULONG>(i), Child)) || Child == NULL) {
+				continue;
+			}
+
+			CComBSTR MemberName;
+			hr = Child->get_name(&MemberName);
+			if (FAILED(hr)) {
+				return hr;
+			}
+
+			CComVariant Value;
+			hr = Child->get_value(&Value);
+			if (FAILED(hr)) {
+				return hr;
+			}
+
+			if (HasMember) {
+				Info += L",\r\n";
+			}
+			Info += L"\t";
+			if (MemberName.m_str != NULL) {
+				Info += MemberName.m_str;
+			}
+			Info += L" = ";
+			Info += VariantToCString(Value, true);
+			HasMember = true;
+		}
+		if (HasMember) {
+			Info += L"\r\n";
+		}
 	}
 
 	Info += L"};";
-
-
 	return S_OK;
 }
-
 HRESULT SymDataType::GetDecl( CString &Info )
 {
 	return GetDef(Info);
@@ -2397,96 +2952,100 @@ HRESULT SymDataType::GetDecl( CString &Info )
 
 HRESULT SymDataType::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	IDiaSymbol *SymType;
+	CComPtr<IDiaSymbol> SymType;
 	HRESULT hr = Self()->get_type(&SymType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || SymType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (SymSub == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SymSub->GetDecl(Info);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-	BSTR Name;
+	CComBSTR Name;
 	hr = Self()->get_name(&Name);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
+	InsertDeclaratorName(Info, Name.m_str);
 
-	int Pos = Info.Find(L'[');
-	if (Pos == -1) {
-		Info += L" ";
-		Info += Name;
-	}
-	else {
-		Info.Insert(Pos, Name);
-	}
-
-	ULONG Loctype;
+	ULONG Loctype = LocIsNull;
 	hr = Self()->get_locationType(&Loctype);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
 	if (Loctype == LocIsBitField) {
-		ULONGLONG Length;
-		CString LengthStr;
+		ULONGLONG Length = 0;
 		hr = Self()->get_length(&Length);
 		ATLASSERT(HR_OK(hr));
-		if (HR_NOK(hr)) {
+		if (FAILED(hr)) {
 			return hr;
 		}
 
-		LengthStr.Format(L" : %I64d", Length);
+		CString LengthStr;
+		LengthStr.Format(L" : %I64u", Length);
 		Info += LengthStr;
 	}
-	
 
-	return hr;
+	return S_OK;
 }
 
 HRESULT SymTypedef::GetDef( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	BSTR Name;
+	CComBSTR Name;
 	HRESULT hr = Self()->get_name(&Name);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-	IDiaSymbol *SymType;
+	CComPtr<IDiaSymbol> SymType;
 	hr = Self()->get_type(&SymType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || SymType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CString TypeStr;
 	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (SymSub == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SymSub->GetDecl(TypeStr);
 	ATLASSERT(HR_OK(hr));
+	if (FAILED(hr)) {
+		return hr;
+	}
 
 	Info = L"typedef ";
-	Info += TypeStr + L" " + Name + L";";
+	Info += TypeStr;
+	InsertDeclaratorName(Info, Name.m_str);
+	Info += L";";
 
-	return hr;
+	return S_OK;
 }
 
 HRESULT SymTypedef::GetDecl( CString &Info )
@@ -2496,39 +3055,46 @@ HRESULT SymTypedef::GetDecl( CString &Info )
 
 HRESULT SymArray::GetDecl( CString &Info )
 {
+	Info.Empty();
 #ifdef DEBUG_PRINT
 	SymbolInfoTable InfoTableDebug;
 	SymBase::GetInfoTable(InfoTableDebug);
 #endif
 
-	IDiaSymbol *SymType;
+	CComPtr<IDiaSymbol> SymType;
 	HRESULT hr = Self()->get_type(&SymType);
 	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
-		return hr;
+	if (FAILED(hr) || SymType == NULL) {
+		return FAILED(hr) ? hr : E_UNEXPECTED;
 	}
 
 	CString TypeStr;
 	CAutoPtr<SymBase> SymSub(SymBase::SymNew(SymType));
+	if (SymSub == NULL) {
+		return E_OUTOFMEMORY;
+	}
 	hr = SymSub->GetDecl(TypeStr);
 	ATLASSERT(HR_OK(hr));
-
-	ULONG Count;
-	CString ArrayCount;
-	hr = Self()->get_count(&Count);
-	ATLASSERT(HR_OK(hr));
-	if (HR_NOK(hr)) {
+	if (FAILED(hr)) {
 		return hr;
 	}
 
-	ArrayCount.Format(L" [%d]", Count);
+	ULONG Count = 0;
+	hr = Self()->get_count(&Count);
+	ATLASSERT(HR_OK(hr));
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	CString ArrayCount;
+	ArrayCount.Format(L" [%lu]", Count);
 	Info = TypeStr + ArrayCount;
 
-	return hr;
+	return S_OK;
 }
 
 HRESULT SymArray::GetDef( CString &Info )
 {
-	ATLASSERT(0);
-	return E_FAIL;
+	Info.Empty();
+	return E_NOTIMPL;
 }
