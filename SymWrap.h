@@ -187,6 +187,7 @@ public:
 	HRESULT Init();
 	HRESULT Open(LPCWSTR FilePath);
 	HRESULT GetSymbol(CComPtr<IDiaSymbol> &Symbol);
+	HRESULT GetSession(CComPtr<IDiaSession> &Session) const;
 	// Compatibility overload. The returned interface has one owned reference.
 	IDiaSymbol *GetSymbol();
 };

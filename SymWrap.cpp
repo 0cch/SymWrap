@@ -224,6 +224,12 @@ HRESULT SymLoader::GetSymbol(CComPtr<IDiaSymbol> &Symbol)
 	return hr;
 }
 
+HRESULT SymLoader::GetSession(CComPtr<IDiaSession> &Session) const
+{
+	Session = _DiaSession;
+	return Session != NULL ? S_OK : E_UNEXPECTED;
+}
+
 IDiaSymbol *SymLoader::GetSymbol()
 {
 	CComPtr<IDiaSymbol> Symbol;
